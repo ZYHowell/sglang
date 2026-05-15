@@ -3331,6 +3331,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+
+        # Under CP, each rank only produced owner-position samples. Rebuild
+        # the request-aligned [bs] vector via all-gather + a
+        # (owner_ranks, request_to_local_slot) pick. One shape-generic path
+        # for extend and decode.
+        # TODO(perf): the advanced-index gather here could be fused with the
+        # all_gather output by a small triton kernel — avoids the
+        # [cp_size, gather_width] intermediate at large bs.
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        if is_prefill_cp_round_robin_split():
+            from sglang.srt.layers.dp_attention import (
+                get_attention_cp_group,
+                get_attention_cp_size,
+            )
+            import torch.distributed as dist
+            cp_size = get_attention_cp_size()
+            cp_group = get_attention_cp_group().device_group
+
+            cp_meta = (
+                forward_batch.cp_decode_meta
+                if forward_batch.forward_mode.is_decode()
+                else forward_batch.cp_extend_meta
+            )
+            gather_width = next_token_ids.shape[0]
+            gathered = torch.empty(
+                cp_size, gather_width,
+                dtype=next_token_ids.dtype, device=next_token_ids.device,
+            )
+            dist.all_gather_into_tensor(
+                gathered, next_token_ids.contiguous(), group=cp_group
+            )
+            next_token_ids = gathered[
+                cp_meta.owner_ranks, cp_meta.request_to_local_slot
+            ]
+            # Under CUDA graph the decode `_CPDecodeMeta` is fixed-shape with
+            # `owner_ranks` / `request_to_local_slot` sized [B = cp_size * P]
+            # (padded request count); slice back to the real global batch.
+            if forward_batch.forward_mode.is_decode():
+                next_token_ids = next_token_ids[
+                    : forward_batch.cp_global_seq_lens.shape[0]
+                ]
+
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 

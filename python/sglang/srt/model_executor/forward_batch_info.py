@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
@@ -49,7 +50,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
+from sglang.srt.layers.utils.cp_utils import (
+    ContextParallelMetadata,
+    is_prefill_cp_round_robin_split,
+)
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -424,6 +428,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
+    # CP scaffolding for the prefill ROUND-ROBIN layout ONLY (the
+    # `cp_round_robin` attention backend) — distinct from `attn_cp_metadata`
+    # above, which is the layout-A / NSA in-seq-split path. These `cp_*` fields
+    # are forwarded from ScheduleBatch and are untouched by any non-round-robin
+    # path (so it is safe to read/reset them gated on round-robin-CP only).
+    cp_owned_indices: Optional[torch.Tensor] = None
+    cp_max_n_owned: Optional[int] = None
+    cp_global_seq_lens: Optional[torch.Tensor] = None
+    cp_global_req_pool_indices: Optional[torch.Tensor] = None
+    # Layer-invariant round-robin-CP metadata (populated by
+    # `CPRoundRobinBackend.init_forward_metadata`; read by every layer and
+    # the sampler).
+    cp_decode_meta: Optional[object] = None
+    cp_extend_meta: Optional[object] = None
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -543,6 +562,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            cp_owned_indices=batch.cp_owned_indices,
+            cp_max_n_owned=batch.cp_max_n_owned,
+            cp_global_seq_lens=batch.cp_global_seq_lens,
+            cp_global_req_pool_indices=batch.cp_global_req_pool_indices,
         )
         device = model_runner.device
 
@@ -609,7 +632,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                # Under CP decode, model sees this rank's owned subset
+                # (padded). Positions are GLOBAL new-token positions of
+                # owned requests; padding rows get position 0. (target_verify
+                # is rejected upstream so the decode branch always has
+                # `cp_owned_indices` set under CP.)
+                if is_prefill_cp_round_robin_split():
+                    owned_idx = batch.cp_owned_indices
+                    max_n_owned = batch.cp_max_n_owned
+                    n_owned = int(owned_idx.numel())
+                    pad = max_n_owned - n_owned
+                    owned_seq_lens = batch.seq_lens.index_select(0, owned_idx)
+                    owned_positions = clamp_position(owned_seq_lens)
+                    if pad > 0:
+                        padding = torch.zeros(
+                            pad,
+                            dtype=owned_positions.dtype,
+                            device=owned_positions.device,
+                        )
+                        owned_positions = torch.cat([owned_positions, padding], dim=0)
+                    ret.positions = owned_positions
+                    ret.batch_size = max_n_owned
+                else:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             assert isinstance(extend_seq_lens, list)
             assert isinstance(extend_prefix_lens, list)
@@ -620,11 +665,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
+            # Under CP, pass cp_size/cp_rank so the position kernel emits
+            # strided GLOBAL positions. Non-CP path collapses to the
+            # original formula.
+            if is_prefill_cp_round_robin_split():
+                _cp_size = get_attention_cp_size()
+                _cp_rank = get_attention_cp_rank()
+            else:
+                _cp_size, _cp_rank = 1, 0
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
+                cp_size=_cp_size,
+                cp_rank=_cp_rank,
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1173,22 +1228,33 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ):
+    """Compute per-token positions and per-request `extend_start_loc`.
+    Default (cp_size=1, cp_rank=0) is the original contiguous formula.
+    Under CP, positions are strided GLOBAL — `prefix + cp_rank + i*cp_size`."""
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
             extend_seq_lens_sum,
+            cp_size,
+            cp_rank,
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens, extend_seq_lens, cp_size, cp_rank
         )
     return positions, extend_start_loc
 
 
 def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
@@ -1208,6 +1274,8 @@ def compute_position_triton(
         extend_prefix_lens,
         extend_seq_lens,
         has_prefix,
+        cp_size,
+        cp_rank,
     )
 
     return positions, extend_start_loc
@@ -1220,6 +1288,8 @@ def compute_position_kernel(
     extend_prefix_lens,
     extend_seq_lens,
     has_prefix: tl.constexpr,
+    cp_size: tl.constexpr,
+    cp_rank: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(0).to(tl.int64)
@@ -1237,19 +1307,25 @@ def compute_position_kernel(
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         tl.store(
             positions + cumsum_start + offset,
-            prefix_len + offset,
+            prefix_len + cp_rank + offset * cp_size,
             mask=offset < seq_len,
         )
     tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ):
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                prefix_len + cp_rank,
+                prefix_len + cp_rank + extend_len * cp_size,
+                cp_size,
+                device=extend_prefix_lens.device,
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
         ],

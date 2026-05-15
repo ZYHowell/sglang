@@ -148,6 +148,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    # Prefill round-robin CP, owner-only decode: the model-facing buffers above
+    # are [P]-sized (P = max_n_owned bucket = the captured `bs`), but the
+    # GLOBAL per-request fields need [B = cp_size * P]-sized buffers. None
+    # outside CP.
+    cp_global_seq_lens: Optional[torch.Tensor]
+    cp_global_req_pool_indices: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -168,6 +174,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        cp_size: int = 1,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
@@ -253,6 +260,20 @@ class DecodeInputBuffers(ForwardInputBuffers):
             device="cpu",
         )
 
+        # Prefill round-robin CP: GLOBAL per-request buffers, sized
+        # `cp_size * max_bs` (since `bs <= cp_size * max_n_owned`).
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+
+        if is_prefill_cp_round_robin_split():
+            with torch.device(device):
+                cp_global_seq_lens = torch.zeros((max_bs * cp_size,), dtype=torch.int32)
+                cp_global_req_pool_indices = torch.zeros(
+                    (max_bs * cp_size,), dtype=torch.int64
+                )
+        else:
+            cp_global_seq_lens = None
+            cp_global_req_pool_indices = None
+
         return cls(
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -273,6 +294,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            cp_global_seq_lens=cp_global_seq_lens,
+            cp_global_req_pool_indices=cp_global_req_pool_indices,
         )
 
     def populate_from_forward_batch(
@@ -304,20 +327,45 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_mask.fill_(False)
 
         # Build batched copy lists for all GPU tensors.
-        dsts = [
-            self.input_ids[:raw_num_token],
-            self.req_pool_indices[:raw_bs],
-            self.seq_lens[:raw_bs],
-            self.out_cache_loc[:raw_num_token],
-            self.positions[:raw_num_token],
-        ]
-        srcs = [
-            forward_batch.input_ids,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-        ]
+        cp_active = self.cp_global_seq_lens is not None
+        if cp_active:
+            # Owner-only decode: `input_ids`/`positions` are [P=raw_bs]; the
+            # GLOBAL per-request fields go into the [B] cp_* buffers; the
+            # standard `seq_lens`/`req_pool_indices` buffers are unused.
+            # `out_cache_loc` is [n_owned] (<= P) — pad with slot 0.
+            dsts = [
+                self.input_ids[:raw_num_token],
+                self.positions[:raw_num_token],
+            ]
+            srcs = [
+                forward_batch.input_ids,
+                forward_batch.positions,
+            ]
+            gb = forward_batch.cp_global_seq_lens.shape[0]
+            self.cp_global_seq_lens[:gb].copy_(forward_batch.cp_global_seq_lens)
+            self.cp_global_seq_lens[gb:].zero_()
+            self.cp_global_req_pool_indices[:gb].copy_(
+                forward_batch.cp_global_req_pool_indices
+            )
+            self.cp_global_req_pool_indices[gb:].zero_()
+            n_owned = forward_batch.out_cache_loc.shape[0]
+            self.out_cache_loc[:n_owned].copy_(forward_batch.out_cache_loc)
+            self.out_cache_loc[n_owned:].zero_()  # padding rows -> slot 0
+        else:
+            dsts = [
+                self.input_ids[:raw_num_token],
+                self.req_pool_indices[:raw_bs],
+                self.seq_lens[:raw_bs],
+                self.out_cache_loc[:raw_num_token],
+                self.positions[:raw_num_token],
+            ]
+            srcs = [
+                forward_batch.input_ids,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+            ]
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -385,8 +433,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
 
-        # CPU tensor copy (cannot be batched with GPU tensors).
-        if forward_batch.seq_lens_cpu is not None:
+        # CPU tensor copy (cannot be batched with GPU tensors). Skipped under
+        # CP — `seq_lens_cpu` is GLOBAL [bs] there (≠ raw_bs = max_n_owned) and
+        # the captured CP forward never reads it (decode metadata uses cg_L).
+        if forward_batch.seq_lens_cpu is not None and not cp_active:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
@@ -562,6 +612,10 @@ class CudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        # Prefill round-robin CP: the captured-forward lazily builds
+        # `_CPDecodeMeta` (graph-pool tensors); stash it per bucket so `replay`
+        # can hand it to the real ForwardBatch for the sampler.
+        self.cp_decode_metas: Dict[int, object] = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -689,6 +743,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            cp_size=get_attention_cp_size(),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -1064,6 +1119,18 @@ class CudaGraphRunner:
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
 
+        # Prefill round-robin CP, owner-only decode: `bs` here is the
+        # max_n_owned bucket (P). Wire the GLOBAL [global_bs = cp_size * bs]
+        # views so the captured `forward_decode` can lazily build `_CPDecodeMeta`.
+        if buffers.cp_global_seq_lens is not None:
+            cp_size = get_attention_cp_size()
+            global_bs = bs * cp_size
+            forward_batch.cp_global_seq_lens = buffers.cp_global_seq_lens[:global_bs]
+            forward_batch.cp_global_req_pool_indices = (
+                buffers.cp_global_req_pool_indices[:global_bs]
+            )
+            forward_batch.cp_max_n_owned = bs
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
@@ -1087,6 +1154,10 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            # Prefill round-robin CP only: The decode metadata build is lazy; reset it so
+            # the `_build_decode_meta` kernels are re-issued — and thus *captured*.
+            if buffers.cp_global_seq_lens is not None:
+                forward_batch.cp_decode_meta = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -1142,6 +1213,12 @@ class CudaGraphRunner:
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
+
+        # CP: the lazy build in layer-0's `forward_decode` set
+        # `forward_batch.cp_decode_meta` (graph-pool tensors, refreshed each
+        # replay). Stash per bucket for `replay` to bridge onto the real batch.
+        if buffers.cp_global_seq_lens is not None:
+            self.cp_decode_metas[bs] = forward_batch.cp_decode_meta
 
         return graph, out
 
@@ -1302,6 +1379,12 @@ class CudaGraphRunner:
             self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]
+
+        # CP: hand the captured-bucket `_CPDecodeMeta` (graph-pool tensors,
+        # just refreshed by the replay) to the real ForwardBatch so the
+        # sampler's owner-rank reconstruction can read it.
+        if self.bs in self.cp_decode_metas:
+            forward_batch.cp_decode_meta = self.cp_decode_metas[self.bs]
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

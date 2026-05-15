@@ -50,6 +50,20 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def is_prefill_cp_round_robin_split():
+    """Generic (non-NSA) prefill round-robin layout: rank i owns globals {i, i+c, ...}.
+
+    Activated by `--enable-prefill-context-parallel --prefill-cp-mode=round-robin-split`.
+    When True, `ScheduleBatch.prepare_for_extend` and `ForwardBatch.init_new` produce
+    local-sized tensors directly (no in-forward split), and the attention backend runs
+    a pass-KV ring across cp ranks.
+    """
+    return (
+        is_prefill_context_parallel_enabled()
+        and get_global_server_args().prefill_cp_mode == "round-robin-split"
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)

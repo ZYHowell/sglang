@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -213,6 +214,8 @@ def build_kv_cache(
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -293,6 +296,10 @@ def build_kv_cache(
                 rank=ps.tp_rank,
                 tp_group=tp_group,
             )
+        elif is_prefill_cp_round_robin_split():
+            from sglang.srt.mem_cache.cp_radix_cache import CPRadixCache
+
+            tree_cache = CPRadixCache(params)
         else:
             tree_cache = RadixCache(params)
 

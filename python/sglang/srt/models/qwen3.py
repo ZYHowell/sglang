@@ -12,6 +12,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -488,7 +489,12 @@ class Qwen3ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    # Pin lm_head gather to attn_tp_group, not the world
+                    # tp_group.
+                    use_attn_tp_group=(
+                        get_global_server_args().enable_dp_lm_head
+                        or is_prefill_cp_round_robin_split()
+                    ),
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

@@ -1067,7 +1067,17 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+
+        if is_prefill_cp_round_robin_split():
+            # `prefix_indices` is LOCAL under CP (len = global_prefix / cp_size);
+            # `extend_input_len` stays GLOBAL (= T - global_prefix).
+            from sglang.srt.layers.dp_attention import get_attention_cp_size
+
+            global_prefix_len = len(self.prefix_indices) * get_attention_cp_size()
+            self.set_extend_input_len(len(self.fill_ids) - global_prefix_len)
+        else:
+            self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1441,6 +1451,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     top_p_normalized_logprobs: bool = False
 
     # For extend and mixed chunekd prefill
+    # Under prefill round-robin CP: `prefix_lens` is GLOBAL; `extend_lens` /
+    # `extend_num_tokens` are LOCAL (this rank's stride of each request).
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
@@ -1448,6 +1460,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+
+    # Owner-only decode under prefill round-robin CP.
+    # Populated in `prepare_for_decode`; None otherwise.
+    cp_owned_indices: Optional[torch.Tensor] = None  # [n_owned] int64, indices into [0,bs)
+    cp_max_n_owned: Optional[int] = None             # max_r count(owner_ranks==r)
+    # GLOBAL [bs] aliases preserved for the attention ring kernel and sampler.
+    cp_global_seq_lens: Optional[torch.Tensor] = None
+    cp_global_req_pool_indices: Optional[torch.Tensor] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -1694,12 +1714,87 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+
+        # Under prefill round-robin CP, slice each request's new tokens to
+        # this rank's stride [prefix_len + cp_rank :: cp_size] (the split
+        # happens here at batch-build time; unsupported combos rejected below).
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        cp_round_robin = is_prefill_cp_round_robin_split()
+        if cp_round_robin:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_cp_rank,
+                get_attention_cp_size,
+                get_attention_tp_size,
+            )
+            from sglang.srt.distributed.parallel_state import (
+                get_moe_expert_parallel_world_size,
+            )
+            cp_size = get_attention_cp_size()
+            cp_rank = get_attention_cp_rank()
+
+            # 3D token layout (DP × CP × attn_tp) not designed yet —
+            # `compute_local_num_token_non_padded` assumes 2D and would
+            # mis-divide under MoE EP > 1.
+            if get_attention_tp_size() > 1 and get_moe_expert_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "Prefill round-robin + attn_tp>1 + MoE EP>1 is not supported "
+                    "(3D DP×CP×attn_tp token layout undesigned)."
+                )
+
+            # Feature gates. Each per-token aux tensor would need its own
+            # stride slice under CP; not wired.
+            for r in reqs:
+                if r.input_embeds is not None:
+                    raise NotImplementedError(
+                        "Prefill round-robin + input_embeds not supported."
+                    )
+                if r.positional_embed_overrides is not None:
+                    raise NotImplementedError(
+                        "Prefill round-robin + positional_embed_overrides not supported."
+                    )
+                if r.multimodal_inputs is not None:
+                    raise NotImplementedError(
+                        "Prefill round-robin + multimodal inputs not supported."
+                    )
+                # A request shorter than cp_size leaves ranks
+                # [len(fill_ids), cp_size) with n_local == 0 for it — those
+                # ranks have no token (not even the last) for the request,
+                # so the owner-rank sampler reconstruction and LogitsProcessor
+                # (empty hidden_states) have nothing to operate on. Fail fast
+                # with a clear message rather than crashing downstream.
+                if len(r.fill_ids) < cp_size:
+                    raise NotImplementedError(
+                        f"Prefill round-robin requires every request to have "
+                        f">= cp_size ({cp_size}) tokens; got a request with "
+                        f"{len(r.fill_ids)}. Short prompts (T < cp_size) leave "
+                        f"some CP rank with n_local == 0."
+                    )
+            if any(r.return_logprob for r in reqs):
+                raise NotImplementedError(
+                    "Prefill round-robin + return_logprob not supported."
+                )
+
+            # `r.prefix_indices` is LOCAL under CP (len = global_prefix / cp_size);
+            # the fill_ids stride and `prefix_lens` need the GLOBAL prefix length.
+            cp_prefix_lens = [len(r.prefix_indices) * cp_size for r in reqs]
+            input_ids = [
+                r.fill_ids[cp_prefix_lens[i] + cp_rank :: cp_size]
+                for i, r in enumerate(reqs)
+            ]
+            extend_lens = [len(ids) for ids in input_ids]
+        else:
+            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+            extend_lens = [r.extend_input_len for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        if cp_round_robin:
+            # `prefix_lens` stays GLOBAL under CP (cp_prefix_lens = local
+            # prefix_indices len * cp_size) — alloc_for_extend / compute_position
+            # consume it as the global prefix length.
+            prefix_lens = cp_prefix_lens
+        else:
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -2072,6 +2167,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # `--enable-mixed-chunk` not supported under CP: prefill and decode
+        # take different CP slicing paths that can't be merged.
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        if is_prefill_cp_round_robin_split():
+            raise NotImplementedError(
+                "Mixed prefill+decode batches (--enable-mixed-chunk) are not "
+                "supported under prefill round-robin CP."
+            )
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2331,6 +2434,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
+        # Owner-only decode scaffolding. Must run before `alloc_for_decode`
+        # so it can use the mirror coords. Uses PRE-increment seq_lens —
+        # owner of req r is `seq_lens_pre[r] % cp_size`.
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        if is_prefill_cp_round_robin_split():
+            from sglang.srt.layers.dp_attention import (
+                get_attention_cp_rank,
+                get_attention_cp_size,
+            )
+            cp_size = get_attention_cp_size()
+            cp_rank = get_attention_cp_rank()
+            owner_ranks_cpu = self.seq_lens_cpu % cp_size
+            owned_cpu = (owner_ranks_cpu == cp_rank).nonzero(as_tuple=True)[0]
+            self.cp_owned_indices = owned_cpu.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+            # max_n_owned = peak per-rank ownership across ranks (NOT
+            # ceil(bs/cp_size) — owner distribution can be skewed).
+            counts = torch.bincount(
+                owner_ranks_cpu.to(torch.int64), minlength=cp_size
+            )
+            self.cp_max_n_owned = int(counts.max().item())
+
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
@@ -2352,6 +2478,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # Slice `input_ids` to this rank's owned subset, padded to
+        # `max_n_owned`. Other per-request fields (seq_lens, req_pool_indices,
+        # orig_seq_lens) stay GLOBAL [bs] — the scheduler mutates them across
+        # decode steps; the attention backend reads the saved aliases.
+        if is_prefill_cp_round_robin_split():
+            owned_idx = self.cp_owned_indices
+            max_n_owned = self.cp_max_n_owned
+            n_owned = int(owned_idx.numel())
+            pad = max_n_owned - n_owned
+
+            self.cp_global_seq_lens = self.seq_lens
+            self.cp_global_req_pool_indices = self.req_pool_indices
+
+            local_input_ids = self.input_ids.index_select(0, owned_idx)
+            if pad > 0:
+                padding = torch.zeros(
+                    pad, dtype=self.input_ids.dtype, device=self.input_ids.device
+                )
+                local_input_ids = torch.cat([local_input_ids, padding], dim=0)
+            self.input_ids = local_input_ids
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(

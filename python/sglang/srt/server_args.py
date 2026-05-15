@@ -168,6 +168,7 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "cp_round_robin",
     # AMD specific
     "aiter",
     "wave",
@@ -248,7 +249,7 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
+PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 

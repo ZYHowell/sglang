@@ -250,7 +250,14 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
+        # Under CP, pin lm_head gather to `attn_tp_group` — the misnamed
+        # world `tp_group` spans CP ranks holding different global tokens'
+        # logits and would mix them.
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        self.use_attn_tp_group = (
+            get_global_server_args().enable_dp_lm_head
+            or is_prefill_cp_round_robin_split()
+        )
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()

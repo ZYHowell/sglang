@@ -30,6 +30,21 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
 )
+
+
+def _assert_tp_args_explicit_under_cp(tp_rank, tp_size, cls_name: str) -> None:
+    """Fail-loud when a parallel Linear is built under CP without explicit
+    `tp_rank` / `tp_size`. The default fallback is the *world* tp_size,
+    which under CP would silently shard weights and all-reduce activations
+    across independent token streams."""
+    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+    if (tp_rank is None or tp_size is None) and is_prefill_cp_round_robin_split():
+        raise RuntimeError(
+            f"{cls_name} constructed under prefill round-robin CP without "
+            "explicit `tp_rank` / `tp_size`. Pass "
+            "`tp_rank=get_attention_tp_rank(), tp_size=get_attention_tp_size()` "
+            "(see Qwen3Attention / Qwen2MLP for the pattern)."
+        )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -337,6 +352,7 @@ class ColumnParallelLinear(LinearBase):
         self.use_presharded_weights = use_presharded_weights
 
         # Divide the weight matrix along the last dimension.
+        _assert_tp_args_explicit_under_cp(tp_rank, tp_size, "ColumnParallelLinear")
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:
@@ -525,6 +541,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         use_presharded_weights: bool = False,
     ):
         self.output_sizes = output_sizes
+        _assert_tp_args_explicit_under_cp(tp_rank, tp_size, "MergedColumnParallelLinear")
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:
@@ -942,6 +959,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
+        _assert_tp_args_explicit_under_cp(tp_rank, tp_size, "QKVParallelLinear")
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:
@@ -1389,6 +1407,7 @@ class RowParallelLinear(LinearBase):
         self.use_dp_attention_reduce = use_dp_attention_reduce
 
         # Divide the weight matrix along the last dimension.
+        _assert_tp_args_explicit_under_cp(tp_rank, tp_size, "RowParallelLinear")
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:

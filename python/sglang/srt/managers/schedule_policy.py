@@ -35,7 +35,10 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.layers.utils.cp_utils import (
+    is_prefill_context_parallel_enabled,
+    is_prefill_cp_round_robin_split,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -473,6 +476,9 @@ class PrefillAdder:
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
+        # Round-robin CP supports multi-request prefill batches (CPRadixCache +
+        # the pass-KV ring handle bs > 1); only in-seq-split / NSA stay capped.
+        self.prefill_cp_round_robin = is_prefill_cp_round_robin_split()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -666,6 +672,14 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        if self.prefill_cp_round_robin:
+            # Chunked prefill under round-robin CP needs chunk boundaries
+            # aligned to cp_size * page_size and CP-aware fill_ids truncation
+            # — not wired for M4. Run with a chunked-prefill size large enough
+            # to keep each prompt in one chunk.
+            raise NotImplementedError(
+                "Chunked prefill + prefill round-robin CP is not supported yet."
+            )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -825,12 +839,13 @@ class PrefillAdder:
             )
         ):
             return AddReqResult.OTHER
-        # TODO support cp with multiple requests
-        # Enabling context parallelism currently presents precision issues;
-        # therefore, the prefill-batch setting is temporarily set to 1.
+        # in-seq-split / NSA CP have precision issues with multi-request
+        # prefill batches, so they stay capped at 1. Round-robin CP does not.
         if (
-            self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
+            (self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled)
+            and not self.prefill_cp_round_robin
+            and len(self.can_run_list) >= 1
+        ):
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:

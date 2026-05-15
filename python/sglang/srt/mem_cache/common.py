@@ -114,6 +114,9 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
+    # Under CP, the caller passes mirror coords; the triton kernel treats them
+    # as ordinary LOCAL positions and writes `out_cache_loc` at LOCAL
+    # `[prefix_lens, seq_lens)` per request.
     if support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
@@ -437,16 +440,43 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
+    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+
+    cp_active = is_prefill_cp_round_robin_split()
+    if cp_active:
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
+        )
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
+    # Under CP, `r.prefix_indices` holds this rank's LOCAL cached slots
+    # (len = global_prefix / cp_size); CPRadixCache produces them.
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_cpu_global = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    seq_lens_cpu_global = batch.seq_lens_cpu
+
+    if cp_active:
+        cp_size = get_attention_cp_size()
+        cp_rank = get_attention_cp_rank()
+        # Mirror coords: ⌈global / cp⌉ — the heaviest rank's local count.
+        prefix_lens_cpu = (prefix_lens_cpu_global + cp_size - 1) // cp_size
+        seq_lens_cpu = (seq_lens_cpu_global + cp_size - 1) // cp_size
+        extend_lens_cpu = seq_lens_cpu - prefix_lens_cpu
+        alloc_extend_num_tokens = int(extend_lens_cpu.sum().item())
+    else:
+        prefix_lens_cpu = prefix_lens_cpu_global
+        seq_lens_cpu = seq_lens_cpu_global
+        extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+        alloc_extend_num_tokens = batch.extend_num_tokens
+
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    seq_lens_device = seq_lens_cpu.to(batch.device, non_blocking=True) if cp_active else batch.seq_lens
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
@@ -456,8 +486,15 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    # CP: `tree_cache.page_size` is the larger cp-aligned KEY page size, so read
+    # the allocator's page size instead.
+    pool_page_size = (
+        batch.token_to_kv_pool_allocator.page_size
+        if cp_active
+        else batch.tree_cache.page_size
+    )
+    if pool_page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -468,10 +505,10 @@ def alloc_for_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens=seq_lens_device,
+            seq_lens_cpu=seq_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
+            extend_num_tokens=alloc_extend_num_tokens,
         )
 
     # Write to req_to_token_pool
@@ -481,15 +518,47 @@ def alloc_for_extend(
         req_pool_indices_cpu,
         prefix_lens_device,
         prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
+        seq_lens_device,
+        seq_lens_cpu,
         extend_lens_device,
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, req_pool_indices_device, req_pool_indices
+    if not cp_active:
+        return out_cache_loc, req_pool_indices_device, req_pool_indices
+
+    # Under CP, mirror-alloc wrote a superset of this rank's REAL extend
+    # range into r2t at LOCAL positions [mirror_prefix, mirror_seq). Extract
+    # this rank's REAL new slots — `n_local_real - mirror_prefix` per request,
+    # starting at LOCAL offset `mirror_prefix` (= P/cp, this rank's real
+    # cached count since the cached prefix is cp-aligned) — for set_kv_buffer.
+    n_local_real_cpu = (
+        (seq_lens_cpu_global - cp_rank + cp_size - 1) // cp_size
+    ).clamp_min(0)
+    real_extend_lens_cpu = (n_local_real_cpu - prefix_lens_cpu).clamp_min(0).to(
+        torch.int64
+    )
+    assert int(real_extend_lens_cpu.sum().item()) == batch.extend_num_tokens, (
+        f"CP real_extend mismatch: r2t-derived "
+        f"{int(real_extend_lens_cpu.sum().item())} vs "
+        f"batch.extend_num_tokens={batch.extend_num_tokens}"
+    )
+    real_pieces = []
+    r2t = batch.req_to_token_pool.req_to_token
+    for r in range(len(req_pool_indices)):
+        n_real_r = int(real_extend_lens_cpu[r].item())
+        pre_r = int(prefix_lens_cpu[r].item())
+        if n_real_r > 0:
+            real_pieces.append(
+                r2t[req_pool_indices[r], pre_r : pre_r + n_real_r]
+            )
+    if real_pieces:
+        out_cache_loc_real = torch.cat(real_pieces).to(torch.int64)
+    else:
+        out_cache_loc_real = torch.empty(0, dtype=torch.int64, device=batch.device)
+    return out_cache_loc_real, req_pool_indices_device, req_pool_indices
 
 
 def alloc_paged_token_slots_decode(
@@ -527,11 +596,94 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     Returns:
         out_cache_loc: allocated cache locations
+
+    Under CP, applies the mirror-alloc rule; the returned `[n_owned]` slots
+    are the OWNER's actual slots for its real K/V write (NOT the
+    mirror-alloc'd superset).
     """
+    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+
+    cp_active = is_prefill_cp_round_robin_split()
+    if cp_active:
+        assert not batch.model_config.is_encoder_decoder, (
+            "Encoder-decoder + CP is not supported."
+        )
+        owned_idx = batch.cp_owned_indices
+        assert owned_idx is not None, (
+            "alloc_for_decode under CP expected batch.cp_owned_indices to be set."
+        )
+        assert token_per_req == 1, "token_per_req > 1 + CP decode not implemented."
 
     batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
+
+    if cp_active:
+        from sglang.srt.layers.dp_attention import get_attention_cp_size
+        cp_size = get_attention_cp_size()
+        page_size = batch.token_to_kv_pool_allocator.page_size
+        device = batch.seq_lens.device
+
+        # Mirror coords: pre/post-increment ⌈T/cp⌉; identical on every rank.
+        # `batch.seq_lens` here is PRE-increment (the new token's position).
+        mirror_pre = (batch.seq_lens + cp_size - 1) // cp_size
+        mirror_post = (batch.seq_lens + 1 + cp_size - 1) // cp_size
+        mirror_pre_cpu = (batch.seq_lens_cpu + cp_size - 1) // cp_size
+        mirror_post_cpu = (batch.seq_lens_cpu + 1 + cp_size - 1) // cp_size
+
+        # Requests where mirror count grew this step need a fresh slot/page;
+        # the rest reuse a slot pre-allocated on an earlier advance step.
+        advance_mask_cpu = mirror_post_cpu > mirror_pre_cpu
+        advance_idx_cpu = advance_mask_cpu.nonzero(as_tuple=True)[0]
+        n_advance = int(advance_idx_cpu.numel())
+
+        if n_advance > 0:
+            advance_idx = advance_idx_cpu.to(device, non_blocking=True)
+            req_pool_advance = batch.req_pool_indices.index_select(0, advance_idx)
+            mirror_post_advance = mirror_post.index_select(0, advance_idx)
+            mirror_pre_advance = mirror_pre.index_select(0, advance_idx)
+            mirror_post_advance_cpu = mirror_post_cpu[advance_idx_cpu]
+
+            if page_size == 1:
+                new_slots = alloc_token_slots(
+                    batch.tree_cache, n_advance * token_per_req
+                )
+            else:
+                last_loc = batch.req_to_token_pool.req_to_token[
+                    req_pool_advance,
+                    (mirror_pre_advance - 1).clamp_min(0),
+                ]
+                # Worst-case 1 new page per advance request; matches non-CP.
+                evict_from_tree_cache(batch.tree_cache, n_advance * page_size)
+                new_slots = batch.token_to_kv_pool_allocator.alloc_decode(
+                    seq_lens=mirror_post_advance,
+                    seq_lens_cpu=mirror_post_advance_cpu,
+                    last_loc=last_loc,
+                )
+                if new_slots is None:
+                    raise RuntimeError(
+                        "Decode OOM under CP page>1 mirror-alloc."
+                    )
+
+            # Every rank writes the new slot at `mirror_post - 1` so
+            # subsequent owner-steps for the same LOCAL position can
+            # look it up.
+            batch.req_to_token_pool.write(
+                (req_pool_advance, mirror_post_advance - 1),
+                new_slots.to(torch.int32),
+            )
+
+        # Owner's slot per owned request = r2t[req_pool, mirror_post - 1]
+        # (which equals owner's real LOCAL pos under round-robin).
+        n_owned = int(owned_idx.numel())
+        if n_owned == 0:
+            return torch.zeros(0, dtype=torch.int64, device=device)
+        owned_req_pool = batch.req_pool_indices.index_select(0, owned_idx)
+        owned_local_pos = mirror_post.index_select(0, owned_idx) - 1
+        out_cache_loc = batch.req_to_token_pool.req_to_token[
+            owned_req_pool, owned_local_pos
+        ]
+        return out_cache_loc.to(torch.int64)
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation

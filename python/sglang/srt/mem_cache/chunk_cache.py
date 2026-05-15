@@ -32,6 +32,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _cp_local_kv_len(global_len: int) -> int:
+    """LOCAL r2t slot count for a request of `global_len` tokens under the
+    mirror-alloc rule. Same on every CP rank so `.free()` returns the same
+    pages from each rank's pool. Non-CP path returns `global_len` unchanged."""
+    from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+    if not is_prefill_cp_round_robin_split():
+        return global_len
+    from sglang.srt.layers.dp_attention import get_attention_cp_size
+    cp_size = get_attention_cp_size()
+    return (global_len + cp_size - 1) // cp_size
+
+
 class ChunkCache(BasePrefixCache):
     """
     ChunkCache is used when radix cache is disabled.
@@ -79,14 +91,17 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
+        # Under CP, free the mirror-alloc'd count (≥ this rank's real n_local).
+        local_len = _cp_local_kv_len(kv_committed_len)
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, :local_len
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        local_len = _cp_local_kv_len(len(req.fill_ids))
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, :local_len
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)

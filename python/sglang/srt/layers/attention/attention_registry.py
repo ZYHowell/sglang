@@ -177,6 +177,19 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
+@register_attention_backend("cp_round_robin")
+def create_cp_round_robin_backend(runner):
+    """Prefill round-robin CP layout. Each rank holds globals {i, i+c, ...}; prefill is a
+    c-stage pass-KV ring built on FA4 fast paths. See `cp_round_robin_backend.py`.
+
+    Pair with `--enable-prefill-context-parallel --prefill-cp-mode=round-robin-split`
+    so upstream batch construction produces local-sized tensors directly.
+    """
+    from sglang.srt.layers.attention.cp_round_robin_backend import CPRoundRobinBackend
+
+    return CPRoundRobinBackend(runner)
+
+
 @register_attention_backend("cutlass_mla")
 def create_cutlass_mla_backend(runner):
     from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend

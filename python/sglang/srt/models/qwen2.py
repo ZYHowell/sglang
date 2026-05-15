@@ -28,7 +28,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -70,11 +75,21 @@ class Qwen2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # sglang misnomer: `tp_size` here is actually *world_size*. The dense
+        # MLP shares the post-attention scatter buffer with attention so it
+        # must shard on `attn_tp_size`, not world. Under CP this also keeps
+        # the all-reduce inside the CP rank (world-group reduce would mix
+        # activations across CP ranks, which hold different token streams).
+        # Backward-compatible: attn_tp == tp without CP/DP.
+        _attn_tp_size = get_attention_tp_size()
+        _attn_tp_rank = get_attention_tp_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            tp_rank=_attn_tp_rank,
+            tp_size=_attn_tp_size,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -82,6 +97,9 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=_attn_tp_rank,
+            tp_size=_attn_tp_size,
+            use_dp_attention_reduce=True,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -282,7 +300,11 @@ class Qwen2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                # Pin embed gather to attn_tp_group, not the (misnamed)
+                # world tp_group.
+                use_attn_tp_group=(
+                    is_dp_attention_enabled() or is_prefill_cp_round_robin_split()
+                ),
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32

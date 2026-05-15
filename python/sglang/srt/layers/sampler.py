@@ -58,8 +58,12 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
+        # Pin token-id MIN-reduce to `attn_tp_group` under DP-attention or
+        # CP — the world `tp_group` would otherwise collapse legitimately
+        # different sampled tokens across DP/CP shards.
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
         self.tp_sync_group = get_tp_group().device_group
-        if is_dp_attention_enabled():
+        if is_dp_attention_enabled() or is_prefill_cp_round_robin_split():
             self.tp_sync_group = get_attention_tp_group().device_group
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
@@ -361,6 +365,8 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
+        # `tp_sync_group` was pinned to `attn_tp_group` in __init__ when CP
+        # or DP-attention is active (no-op when attn_tp_size == 1).
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
