@@ -3013,6 +3013,23 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+            # Mixed chunked prefill cannot run under prefill round-robin CP
+            # because prefill rows and decode rows live in different per-rank
+            # coordinate systems (stride vs owner-only). Auto-disable
+            # following the spec-v2 / DFLASH precedent rather than crash later
+            # inside mix_with_running. See schedule_batch.py:mix_with_running
+            # for the deferred unification.
+            if (
+                self.enable_prefill_context_parallel
+                and self.prefill_cp_mode == "round-robin-split"
+                and self.enable_mixed_chunk
+            ):
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because it is not "
+                    "supported under prefill round-robin context parallelism."
+                )
+
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (

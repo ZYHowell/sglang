@@ -1742,16 +1742,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             # Feature gates. Each per-token aux tensor would need its own
-            # stride slice under CP; not wired.
+            # stride slice under CP; only the ones whose slice is wired below
+            # are allowed.
             for r in reqs:
-                if r.input_embeds is not None:
-                    raise NotImplementedError(
-                        "Prefill round-robin + input_embeds not supported."
-                    )
-                if r.positional_embed_overrides is not None:
-                    raise NotImplementedError(
-                        "Prefill round-robin + positional_embed_overrides not supported."
-                    )
                 if r.multimodal_inputs is not None:
                     raise NotImplementedError(
                         "Prefill round-robin + multimodal inputs not supported."
@@ -1769,10 +1762,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         f"{len(r.fill_ids)}. Short prompts (T < cp_size) leave "
                         f"some CP rank with n_local == 0."
                     )
-            if any(r.return_logprob for r in reqs):
-                raise NotImplementedError(
-                    "Prefill round-robin + return_logprob not supported."
-                )
+            # Output-only logprob is supported (next_token_logprobs is
+            # all-gathered alongside next_token_ids in ModelRunner.sample —
+            # F3). Input logprobs and per-position top-k logprobs are NOT
+            # supported under CP: each rank only computes logprobs for its
+            # stride, so reconstructing the per-input-token logprob arrays
+            # would require an extra all-gather + interleave that we have
+            # not wired. Reject the request-level features that would
+            # trigger those paths.
+            for r in reqs:
+                if not r.return_logprob:
+                    continue
+                if r.top_logprobs_num > 0:
+                    raise NotImplementedError(
+                        "Prefill round-robin + top_logprobs_num > 0 not supported."
+                    )
+                if r.token_ids_logprob is not None:
+                    raise NotImplementedError(
+                        "Prefill round-robin + token_ids_logprob not supported."
+                    )
+                # logprob_start_len < extend_input_len would request INPUT
+                # logprobs over a strided subset — defer that.
+                if r.logprob_start_len != -1 and r.logprob_start_len < len(r.fill_ids) - 1:
+                    raise NotImplementedError(
+                        "Prefill round-robin + INPUT logprob (logprob_start_len "
+                        "before the last token) not supported; only output "
+                        "logprob is wired."
+                    )
 
             # `r.prefix_indices` is LOCAL under CP (len = global_prefix / cp_size);
             # the fill_ids stride and `prefix_lens` need the GLOBAL prefix length.
@@ -1872,14 +1888,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # fill_ids/extend_input_len on chunk overflow but not input_embeds.
-                input_embeds.extend(
-                    req.input_embeds[pre_len : pre_len + req.extend_input_len]
-                )
+                # Under CP, take the same per-rank stride as input_ids
+                # (line 1750 above): rank `cp_rank` owns globals
+                # {cp_rank, cp_rank + cp_size, ...} of the new tokens.
+                if cp_round_robin:
+                    input_embeds.extend(
+                        req.input_embeds[
+                            pre_len + cp_rank : pre_len + req.extend_input_len : cp_size
+                        ]
+                    )
+                else:
+                    input_embeds.extend(
+                        req.input_embeds[pre_len : pre_len + req.extend_input_len]
+                    )
 
             if req.positional_embed_overrides is not None:
                 # Override positions are absolute in the full sequence.
                 # Convert to extend-tensor coordinates by subtracting pre_len,
                 # then skip any that fall within the cached prefix.
+                # Under CP, keep only positions this rank actually owns
+                # (extend_pos % cp_size == cp_rank) and shift the local
+                # offset to local stride coords (extend_pos // cp_size).
                 embeds_to_add = []
                 for embed_idx, pos in enumerate(
                     req.positional_embed_overrides.positions
@@ -1887,7 +1916,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     extend_pos = pos - pre_len
                     if extend_pos < 0 or extend_pos >= req.extend_input_len:
                         continue  # Outside current extend chunk, skip
-                    embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
+                    if cp_round_robin:
+                        if (extend_pos % cp_size) != cp_rank:
+                            continue
+                        local_extend_pos = extend_pos // cp_size
+                    else:
+                        local_extend_pos = extend_pos
+                    embeds_to_add.append(
+                        (embed_idx, input_id_pointer + local_extend_pos)
+                    )
                 if embeds_to_add:
                     has_replace_embeds = True
                     indices, positions = zip(*embeds_to_add)
@@ -1940,8 +1977,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlens_cpu,
                 )
 
-            if self.return_logprob:
+            if self.return_logprob and not cp_round_robin:
                 # Find input logprob token ids.
+                # Under CP only OUTPUT logprob is supported; INPUT logprob would
+                # need per-stride reconstruction, deferred. Skipping this block
+                # is paired with the `extend_logprob_start_lens = extend_lens`
+                # override below, which forces `extend_return_logprob = False`
+                # in LogitsProcessor.from_forward_batch so the per-position
+                # logprob path is not entered.
                 # First, find a global index within origin_input_ids and slide it by 1
                 # to compute input logprobs. It is because you need the next token
                 # to compute input logprobs. E.g., (chunk size 2)
@@ -2053,6 +2096,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        if cp_round_robin and self.return_logprob:
+            # OUTPUT logprob is supported under CP via the all-gather in
+            # ModelRunner.sample; INPUT logprob is not. Force
+            # start_lens == seq_lens (both local) so
+            # LogitsProcessor.from_forward_batch sets
+            # extend_return_logprob = False and skips the per-input-position
+            # logprob path entirely.
+            self.extend_logprob_start_lens = list(extend_lens)
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -2167,13 +2218,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
-        # `--enable-mixed-chunk` not supported under CP: prefill and decode
-        # take different CP slicing paths that can't be merged.
+        # `--enable-mixed-chunk` under CP requires unifying two different
+        # per-rank slicings into a single MIXED batch:
+        #   * prefill rows: per-rank stride (every rank contributes
+        #     ⌈new_tokens / cp_size⌉ rows per request)
+        #   * decode rows: owner-only (only `(seq_len-1) % cp_size == cp_rank`
+        #     contributes a row; non-owner ranks contribute nothing)
+        # After running_batch.prepare_for_decode() under CP, running_batch's
+        # input_ids is `[max_n_owned]` (owner-only + zero-padding) while the
+        # new prefill batch's input_ids is `[sum_local_extend]` (stride).
+        # Concatenating them as ForwardBatch.input_ids would feed the model a
+        # tensor whose rows live in two different CP coordinate systems; the
+        # attention backend, the sampler all-gather, and the metadata kernels
+        # all assume one or the other but not both.
+        # Unifying these requires (a) a MIXED branch in
+        # ForwardBatch.init_new building per-row positions, (b) a MIXED
+        # branch in cp_round_robin_backend.forward_extend distinguishing
+        # prefill vs decode rows in the metadata kernels, and (c) a
+        # MIXED-aware extend_seq_lens that is `1` only on the owner rank for
+        # decode rows. Multi-session work; left as a known limitation.
         from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
         if is_prefill_cp_round_robin_split():
             raise NotImplementedError(
                 "Mixed prefill+decode batches (--enable-mixed-chunk) are not "
-                "supported under prefill round-robin CP."
+                "supported under prefill round-robin CP — prefill and decode "
+                "rows live in different per-rank coordinate systems "
+                "(see comment above). Run without --enable-mixed-chunk under CP."
             )
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()

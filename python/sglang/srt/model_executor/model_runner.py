@@ -3365,6 +3365,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             next_token_ids = gathered[
                 cp_meta.owner_ranks, cp_meta.request_to_local_slot
             ]
+            # F3: same shape-generic gather for output logprob. Each rank's
+            # `next_token_logprobs[i]` is only meaningful when this rank owns
+            # request i's last token; pick by (owner_rank, local_slot) like
+            # the token ids. Skipped when no req asked for logprob —
+            # `next_token_logprobs` is None.
+            if logits_output.next_token_logprobs is not None:
+                gathered_lp = torch.empty(
+                    cp_size, gather_width,
+                    dtype=logits_output.next_token_logprobs.dtype,
+                    device=logits_output.next_token_logprobs.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered_lp,
+                    logits_output.next_token_logprobs.contiguous(),
+                    group=cp_group,
+                )
+                logits_output.next_token_logprobs = gathered_lp[
+                    cp_meta.owner_ranks, cp_meta.request_to_local_slot
+                ]
             # Under CUDA graph the decode `_CPDecodeMeta` is fixed-shape with
             # `owner_ranks` / `request_to_local_slot` sized [B = cp_size * P]
             # (padded request count); slice back to the real global batch.
@@ -3372,6 +3391,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 next_token_ids = next_token_ids[
                     : forward_batch.cp_global_seq_lens.shape[0]
                 ]
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs[
+                            : forward_batch.cp_global_seq_lens.shape[0]
+                        ]
+                    )
 
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
