@@ -1939,10 +1939,13 @@ def initialize_model_parallel(
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
-    if attn_cp_size > moe_dp_size:
+    if attn_cp_size > moe_dp_size and moe_dp_size > 1:
         # When moe_dp_size < attn_cp_size, CP ranks must share tokens before MoE.
         # The MOE_DP group includes these CP partners, so the existing DP
         # allgather/scatter handles the token sharing.
+        # When moe_dp_size == 1 (CP→EP mode), we deliberately do NOT alias to 
+        # _ATTN_CP: each rank is its own DP group and the EP a2a dispatcher 
+        # handles cross-rank token movement instead.
         _MOE_DP = _ATTN_CP
     elif moe_dp_size == tensor_model_parallel_size:
         _MOE_DP = _TP

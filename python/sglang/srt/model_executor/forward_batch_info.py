@@ -958,9 +958,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
         # make sure that each rank has the same number of tokens to do collective communication.
-        attn_cp_size = get_attention_cp_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+        # Under prefill round-robin CP, each rank arrives with a stride'd
+        # slice of input ids whose count varies by rank when seq_len isn't
+        # divisible by cp_size. Padding the SMALLER rank up to the LARGER
+        # rank's count produces token-0 embedding rows that propagate as
+        # NaN to the LM head (see require_attn_tp_gather() rationale). The
+        # round-robin layout's stride'd counts are already self-consistent
+        # — skip the cp_size ceiling alignment here. attn_tp_size align
+        # above still applies (reduce-scatter dimension).
+        from sglang.srt.layers.utils.cp_utils import is_prefill_cp_round_robin_split
+        if not is_prefill_cp_round_robin_split():
+            attn_cp_size = get_attention_cp_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

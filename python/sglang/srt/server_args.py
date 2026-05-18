@@ -3180,6 +3180,33 @@ class ServerArgs:
                 f"with torch.compile)."
             )
 
+    def _model_is_moe(self) -> bool:
+        """Best-effort check whether `--model-path` points to an MoE model.
+
+        Used by the CP→EP auto-config: at __post_init__ time the ModelConfig
+        is not built yet, so we peek at config.json directly. Falls back to
+        False on any error (the auto-config block then no-ops, which is the
+        safe default for dense models — they don't need EP).
+        """
+        try:
+            import json, os
+
+            cfg_path = os.path.join(self.model_path, "config.json")
+            if not os.path.exists(cfg_path):
+                return False
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            # Common MoE markers across HF configs we see (Qwen MoE,
+            # DeepSeek V3, Mixtral, etc.). `num_experts` is the dense
+            # check; some MoE models call it `num_local_experts` or
+            # `n_routed_experts`.
+            for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+                if cfg.get(key, 0):
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
@@ -3205,6 +3232,79 @@ class ServerArgs:
             logger.info(
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        # CP → EP auto-config: when attention CP is active on an MoE model
+        # and the user has not explicitly chosen an a2a backend, default
+        # to using the CP ranks as EP ranks in MoE (each owns a subset of
+        # experts; cross-rank token dispatch via DeepEP's low-latency
+        # kernel + deep_gemm BF16 grouped GEMM for compute).
+        #
+        # This is the ONLY supported CP→EP path. We hard-require
+        # `deep_gemm` because:
+        #   1. flashinfer MoeAlltoAll runs cutlass MoE which itself does
+        #      internal EP routing — incompatible with externally-routed
+        #      dispatch payloads (verified to produce garbage outputs).
+        #   2. The triton MoE runner doesn't have a (deepep_*, triton)
+        #      pre-permute registered, and the standard runner assumes
+        #      "every rank has every token + post-experts all-reduce"
+        #      which conflicts with the per-rank stride'd token layout
+        #      under round-robin CP.
+        #   3. DeepGemmRunnerCore's masked/contiguous BF16 paths consume
+        #      deepep dispatch output directly via its registered
+        #      (deepep_{ll,normal}, deep_gemm) pre/post permutes and
+        #      produce token-exact output vs cp=1 baseline.
+        #
+        # The mirror case — `moe_dp_size > 1` matching `attn_cp_size` —
+        # keeps zigzag-CP's allgather-sandwich semantics via `_MOE_DP =
+        # _ATTN_CP` in parallel_state.py.
+        # `flashinfer_trtllm` is the sm100 default for several MoE arches
+        # (Qwen3-MoE etc.) — auto-set earlier in __post_init__ before this
+        # block. It does CUTLASS-internal EP routing and doesn't support
+        # the per-rank-stride tokens our CP layout produces; verified to
+        # hang in collectives at decode time. Treat it as overridable
+        # under CP. The explicit user-set value (e.g. `--moe-runner-backend
+        # triton`) still wins.
+        cp_overridable_runner_backends = ("auto", "flashinfer_trtllm")
+        if (
+            self.attn_cp_size > 1
+            and self.moe_a2a_backend == "none"
+            and self.moe_runner_backend in cp_overridable_runner_backends
+            and self.moe_dp_size <= 1
+            and self._model_is_moe()
+        ):
+            # Require deep_gemm — see rationale above.
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                raise NotImplementedError(
+                    "CP→EP requires deep_gemm (build from "
+                    "https://github.com/deepseek-ai/DeepGEMM main; v2.5+ has "
+                    "sm_100 BF16 grouped GEMMs needed for B200). Falling "
+                    "back to non-EP or pure CP is not auto-supported."
+                )
+            self.moe_a2a_backend = "deepep"
+            self.moe_runner_backend = "deep_gemm"
+            # Honor a user-set --deepep-mode if any; default to low_latency
+            # (decode is the production target; for prefill-heavy benches
+            # where per-rank tokens exceed the LL cap of 1024, pass
+            # --deepep-mode normal explicitly).
+            if self.deepep_mode == "auto":
+                self.deepep_mode = "low_latency"
+            self.moe_dp_size = 1
+            # BF16 dispatch — deep_gemm runner consumes BF16 tokens via
+            # its (deepep_ll, deep_gemm) permute. The deprecated env var
+            # is the fallback hook honored by get_deepep_output_dtype();
+            # without it the deepep dispatcher would quantize to FP8
+            # which the BF16 runner can't process. The new equivalent
+            # is `--deepep-dispatcher-output-dtype bf16`.
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
+            logger.warning(
+                f"CP→EP auto-config: attn_cp_size={self.attn_cp_size} > 1 on "
+                f"MoE model. Forcing moe_a2a_backend=deepep, "
+                f"moe_runner_backend=deep_gemm, deepep_mode={self.deepep_mode}, "
+                f"moe_dp_size=1, SGLANG_DEEPEP_BF16_DISPATCH=1. Cross-rank "
+                f"tokens dispatched via DeepEP."
             )
 
         if self.moe_a2a_backend == "deepep":
@@ -3268,9 +3368,18 @@ class ServerArgs:
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
-            assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+            # flashinfer_cutlass is the recommended runner (FP4/FP8 fast paths),
+            # but the FlashinferDispatcher itself is dtype-agnostic so any
+            # runner that accepts the FLASHINFER dispatch format works. The
+            # CP→EP auto-config above pairs flashinfer a2a with the standard
+            # triton runner for BF16 MoE — warn instead of asserting.
+            if self.moe_runner_backend not in ["flashinfer_cutlass"]:
+                logger.warning(
+                    f"Flashinfer MoE A2A is paired with moe_runner_backend="
+                    f"{self.moe_runner_backend} (not flashinfer_cutlass). "
+                    f"This is the BF16 / non-quantized path; expect lower "
+                    f"throughput than the cutlass FP4 path."
+                )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

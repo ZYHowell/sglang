@@ -66,6 +66,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     is_prefill_context_parallel_enabled,
+    is_prefill_cp_round_robin_split,
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -968,7 +969,10 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=(
+                get_global_server_args().enable_dp_lm_head
+                or is_prefill_cp_round_robin_split()
+            ),
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -994,7 +998,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled():
+        # `attn_cp_metadata` drives the zigzag-CP `cp_split_and_rebuild_data` /
+        # `cp_all_gather_rerange_output` path in Qwen2MoeModel.forward. Under
+        # round-robin CP each rank already arrives with stride'd input_ids
+        # (per ScheduleBatch.prepare_for_extend) — splitting again would halve
+        # the local rows and break shape consistency with the kv-cache write.
+        # Only the zigzag layout should populate attn_cp_metadata.
+        if is_prefill_context_parallel_enabled() and not is_prefill_cp_round_robin_split():
             if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

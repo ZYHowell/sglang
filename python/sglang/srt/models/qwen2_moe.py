@@ -80,6 +80,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     is_prefill_context_parallel_enabled,
+    is_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -738,7 +739,14 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                # Pin embed gather to attn_tp_group, not the (misnamed) world
+                # tp_group: under prefill round-robin CP each rank has
+                # stride'd input_ids and an all-reduce across the CP-spanning
+                # tp_group would mix per-rank vocab pieces from different
+                # tokens. Mirrors qwen2.py (dense path).
+                use_attn_tp_group=(
+                    is_dp_attention_enabled() or is_prefill_cp_round_robin_split()
+                ),
                 quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
@@ -891,7 +899,10 @@ class Qwen2MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=(
+                get_global_server_args().enable_dp_lm_head
+                or is_prefill_cp_round_robin_split()
+            ),
         )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
