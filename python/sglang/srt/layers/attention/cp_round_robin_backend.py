@@ -811,6 +811,7 @@ def _attn_decode_call(
     seqused_k: torch.Tensor,        # [P]   int32 — per-row KV length (0 = inactive)
     page_table: torch.Tensor,       # [P, L] int32 — per-row KV-pool slot indices
     max_seqlen_k: int,
+    num_splits: int,
 ):
     """FA4 decode call, paged-KV mode — FA reads KV directly from the pool via
     `page_table`, no explicit gather buffer. `page_table` mode requires
@@ -818,18 +819,11 @@ def _attn_decode_call(
     `[num_pages, page_size, H_kv, D]`; inactive rows get `seqused_k == 0` → FA
     emits `-inf` lse.
 
-    FA4 (cute DSL) unifies prefill and decode under `flash_attn_varlen_func`;
-    the decode-optimized path is reached by `num_splits > 1` (split-K along
-    KV) — for Sq=1 with few active rows this is critical, else only a handful
-    of SMs work and the kernel is launch-bound. SplitKV is sm100-only;
-    elsewhere fall back to num_splits=1."""
-    cap = torch.cuda.get_device_capability(q.device)
-    if cap[0] == 10 and max_seqlen_k > 256:
-        # sm100 split-K heuristic: scale with KV length, cap at 16.
-        num_splits = max(1, min(16, (max_seqlen_k + 511) // 512))
-    else:
-        num_splits = 1
-
+    `num_splits` is the FA4 split-K count along KV. Caller decides:
+    `0` (auto) under eager, `1` under CUDA graph — mirrors
+    `flashattention_backend.py` and avoids the short-KV over-launch that a
+    `cg_L`-derived heuristic would create (every captured split block stays
+    alive at replay regardless of the per-row `seqused_k` early-exit)."""
     return flash_attn_varlen_func(
         q, key_cache, value_cache,
         cu_seqlens_q=cu_seqlens_q,
@@ -851,6 +845,7 @@ def pass_q_ring_decode_owner_only(
     cp_size: int,
     cp_rank: int,
     cp_group,
+    num_splits: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Owner-only c-stage pass-Q ring for decode — fixed-shape & CUDA-graph
     capturable (`P` is a bucket constant). Every ring stage runs FA on all `P`
@@ -901,6 +896,7 @@ def pass_q_ring_decode_owner_only(
             seqused_k=meta.seqused_k[stage],
             page_table=meta.page_table[stage],
             max_seqlen_k=meta.L,
+            num_splits=num_splits,
         )
         _pop()
 
@@ -1025,6 +1021,13 @@ class CPRoundRobinBackend(AttentionBackend):
         self.cp_group = get_attention_cp_group().device_group
         self._context_len = model_runner.model_config.context_len
         self.cg_L = None  # set by `init_cuda_graph_state`
+        # FA4 decode split-K. Mirror `flashattention_backend.py:207-216`:
+        # FA4 does not support `num_splits=0` (auto) under CUDA graph, so we
+        # pin it to 1 there; in eager we let FA derive splits from live
+        # `cache_seqlens`. Picking splits from `max_seqlen_k=cg_L` (the old
+        # heuristic) over-launches at short actual KV — see "FA split-K
+        # over-launch" in `doc/cp_perf_history.md`'s deferred-tuning note.
+        self.num_splits = 0 if model_runner.server_args.disable_cuda_graph else 1
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
         """Precompute layer-invariant CP metadata once per forward batch.
@@ -1167,6 +1170,7 @@ class CPRoundRobinBackend(AttentionBackend):
             q, key_cache, value_cache,
             meta=meta,
             cp_size=self.cp_size, cp_rank=self.cp_rank, cp_group=self.cp_group,
+            num_splits=self.num_splits,
         )
         return out.reshape(P, layer.tp_q_head_num * layer.v_head_dim)
 
