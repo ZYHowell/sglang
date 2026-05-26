@@ -3292,19 +3292,28 @@ class ServerArgs:
             if self.deepep_mode == "auto":
                 self.deepep_mode = "low_latency"
             self.moe_dp_size = 1
-            # BF16 dispatch — deep_gemm runner consumes BF16 tokens via
-            # its (deepep_ll, deep_gemm) permute. The deprecated env var
-            # is the fallback hook honored by get_deepep_output_dtype();
-            # without it the deepep dispatcher would quantize to FP8
-            # which the BF16 runner can't process. The new equivalent
-            # is `--deepep-dispatcher-output-dtype bf16`.
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
+            # Dispatch dtype must match deep_gemm runner's weight branch:
+            #   BF16 weights → _run_masked_bf16_gemm (needs BF16 dispatch)
+            #   FP8  weights → _run_masked_gemm    (needs FP8  dispatch
+            #                  with hidden_states_scale, which the FP8
+            #                  per-token quant path in deepep produces)
+            # For BF16 models we force the deprecated BF16-dispatch hook
+            # (the dispatcher's auto-detect would otherwise quantize to
+            # FP8, which the BF16 runner can't consume). For FP8 models
+            # we leave dispatch dtype unset → auto-detect returns FP8.
+            model_is_fp8 = (
+                isinstance(self.quantization, str)
+                and self.quantization in ("fp8", "modelopt_fp8")
+            )
+            if not model_is_fp8:
+                envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
             logger.warning(
                 f"CP→EP auto-config: attn_cp_size={self.attn_cp_size} > 1 on "
-                f"MoE model. Forcing moe_a2a_backend=deepep, "
-                f"moe_runner_backend=deep_gemm, deepep_mode={self.deepep_mode}, "
-                f"moe_dp_size=1, SGLANG_DEEPEP_BF16_DISPATCH=1. Cross-rank "
-                f"tokens dispatched via DeepEP."
+                f"MoE model (quant={self.quantization!r}). Forcing "
+                f"moe_a2a_backend=deepep, moe_runner_backend=deep_gemm, "
+                f"deepep_mode={self.deepep_mode}, moe_dp_size=1, "
+                f"deepep_dispatch={'fp8 (auto)' if model_is_fp8 else 'bf16'}. "
+                f"Cross-rank tokens dispatched via DeepEP."
             )
 
         if self.moe_a2a_backend == "deepep":
